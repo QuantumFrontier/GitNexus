@@ -192,6 +192,86 @@ function resolveCliPath() {
   }
 }
 
+/**
+ * Concurrency guard for the augment subprocess.
+ *
+ * Editors fire postToolUse hooks per parallel tool call. With no cap, N
+ * parallel Grep/Read/Shell tool calls spawn N concurrent `gitnexus augment`
+ * subprocesses — each a Node + LadybugDB cold start that holds resources
+ * for several seconds. Issue #1486 reported 180+ piled-up processes and
+ * load average > 100 on the Claude variant; the same shape applies here.
+ *
+ * Implementation: lockfiles named `<pid>.lock` under `<.gitnexus>/.hook-locks/`.
+ * Stale entries are pruned by age (>30s mtime) or by pid-liveness check.
+ */
+const HOOK_LOCK_SUBDIR = '.hook-locks';
+const HOOK_LOCK_MAX_INFLIGHT = 3;
+const HOOK_LOCK_STALE_MS = 30000;
+
+function acquireHookSlot(gitNexusDir) {
+  const lockDir = path.join(gitNexusDir, HOOK_LOCK_SUBDIR);
+  let entries;
+  try {
+    fs.mkdirSync(lockDir, { recursive: true });
+    entries = fs.readdirSync(lockDir);
+  } catch {
+    return () => {};
+  }
+
+  const now = Date.now();
+  let active = 0;
+  for (const entry of entries) {
+    if (!entry.endsWith('.lock')) continue;
+    const lockPath = path.join(lockDir, entry);
+    const pid = Number.parseInt(entry, 10);
+    let stale = false;
+    try {
+      const stat = fs.statSync(lockPath);
+      if (now - stat.mtimeMs > HOOK_LOCK_STALE_MS) stale = true;
+    } catch {
+      stale = true;
+    }
+    if (!stale && Number.isFinite(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        active++;
+        continue;
+      } catch {
+        stale = true;
+      }
+    }
+    if (stale) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        /* another hook beat us to it */
+      }
+    }
+  }
+
+  if (active >= HOOK_LOCK_MAX_INFLIGHT) return null;
+
+  const ownLock = path.join(lockDir, `${process.pid}.lock`);
+  try {
+    fs.writeFileSync(ownLock, '', { flag: 'wx' });
+  } catch {
+    return () => {};
+  }
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      fs.unlinkSync(ownLock);
+    } catch {
+      /* pruned by another hook */
+    }
+  };
+  process.on('exit', release);
+  return release;
+}
+
 function runGitNexusCli(cliPath, args, cwd, timeout) {
   const isWin = process.platform === 'win32';
   if (cliPath) {
@@ -227,13 +307,17 @@ function main() {
     }
     const cwd = input.cwd || process.cwd();
     if (!path.isAbsolute(cwd)) return;
-    if (!findGitNexusDir(cwd)) return;
+    const gitNexusDir = findGitNexusDir(cwd);
+    if (!gitNexusDir) return;
 
     const toolName = input.tool_name || '';
     const toolInput = input.tool_input || {};
 
     const pattern = extractPattern(toolName, toolInput);
     if (!pattern || pattern.length < 3) return;
+
+    const release = acquireHookSlot(gitNexusDir);
+    if (!release) return;
 
     const cliPath = resolveCliPath();
     let result = '';
@@ -244,6 +328,8 @@ function main() {
       }
     } catch {
       /* graceful failure */
+    } finally {
+      release();
     }
 
     if (result && result.trim()) {

@@ -294,6 +294,129 @@ describe('Git mutation regex', () => {
   }
 });
 
+// ─── Source code regression: PreToolUse concurrency guard (#1486) ──
+
+describe('PreToolUse concurrency guard', () => {
+  for (const [label, hookPath] of [
+    ['CJS', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+  ] as const) {
+    it(`${label} hook defines acquireHookSlot`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      expect(source).toContain('function acquireHookSlot');
+      expect(source).toContain('HOOK_LOCK_MAX_INFLIGHT');
+    });
+
+    it(`${label} hook calls acquireHookSlot in handlePreToolUse`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      const preBody = source.slice(
+        source.indexOf('function handlePreToolUse'),
+        source.indexOf('function handlePostToolUse'),
+      );
+      expect(preBody).toContain('acquireHookSlot(');
+      expect(preBody).toMatch(/release\(\)/);
+    });
+  }
+});
+
+// ─── Integration: concurrency guard skips when slots are full ──────
+
+describe('PreToolUse concurrency guard (integration)', () => {
+  for (const [label, hookPath] of [
+    ['CJS', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+  ] as const) {
+    it(`${label}: hook exits silently when MAX_INFLIGHT lockfiles for live pids exist`, async () => {
+      const { spawn } = await import('child_process');
+      const lockDir = path.join(gitNexusDir, '.hook-locks');
+      fs.mkdirSync(lockDir, { recursive: true });
+
+      // Spawn 3 long-sleeping node child processes to use as live PIDs.
+      const sleepers = [0, 1, 2].map(() =>
+        spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], {
+          stdio: 'ignore',
+          detached: false,
+        }),
+      );
+      const writtenLocks: string[] = [];
+      try {
+        for (const child of sleepers) {
+          const p = path.join(lockDir, `${child.pid}.lock`);
+          fs.writeFileSync(p, '');
+          writtenLocks.push(p);
+        }
+
+        const result = runHook(hookPath, {
+          hook_event_name: 'PreToolUse',
+          tool_name: 'Grep',
+          tool_input: { pattern: 'validateUser' },
+          cwd: tmpDir,
+        });
+
+        expect(result.stdout.trim()).toBe('');
+        const afterFiles = fs.readdirSync(lockDir).filter((f) => f.endsWith('.lock'));
+        // Sentinel locks remain; the hook bailed before acquiring its own slot.
+        expect(afterFiles.length).toBe(3);
+      } finally {
+        for (const child of sleepers) {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const p of writtenLocks) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            /* ignore */
+          }
+        }
+        try {
+          fs.rmdirSync(lockDir);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it(`${label}: hook prunes stale lockfiles (dead pid)`, () => {
+      const lockDir = path.join(gitNexusDir, '.hook-locks');
+      fs.mkdirSync(lockDir, { recursive: true });
+      // PID 1 exists on every POSIX system (init); on Windows process.kill(1,0)
+      // throws. Use a definitely-dead PID instead: a very large number unlikely
+      // to be assigned.
+      const deadPid = 2_147_483_640;
+      const stalePath = path.join(lockDir, `${deadPid}.lock`);
+      try {
+        fs.writeFileSync(stalePath, '');
+        expect(fs.existsSync(stalePath)).toBe(true);
+
+        runHook(hookPath, {
+          hook_event_name: 'PreToolUse',
+          tool_name: 'Grep',
+          tool_input: { pattern: 'validateUser' },
+          cwd: tmpDir,
+        });
+
+        // After the hook runs, the dead-pid lockfile should be pruned.
+        expect(fs.existsSync(stalePath)).toBe(false);
+      } finally {
+        try {
+          fs.unlinkSync(stalePath);
+        } catch {
+          /* already pruned */
+        }
+        try {
+          fs.rmdirSync(lockDir);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+  }
+});
+
 // ─── Integration: PostToolUse staleness detection ───────────────────
 
 describe('PostToolUse staleness detection (integration)', () => {
