@@ -331,6 +331,24 @@ describe('PreToolUse concurrency guard', () => {
       );
       expect(slotFn).not.toContain('readdirSync');
     });
+
+    it(`${label} hook fails closed when lock dir cannot be created`, () => {
+      // Regression: an earlier revision returned `() => {}` (truthy no-op) on
+      // mkdirSync failure, which left callers — `if (!release) return;` — to
+      // proceed unguarded and reintroduce the #1486 fan-out on read-only or
+      // cross-user `.gitnexus/` setups. The guard must fail closed (null).
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      const slotFn = source.slice(
+        source.indexOf('function acquireHookSlot'),
+        source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+      );
+      const mkdirCatch = slotFn.slice(
+        slotFn.indexOf('fs.mkdirSync(lockDir'),
+        slotFn.indexOf('const myPidStr'),
+      );
+      expect(mkdirCatch).toContain('return null');
+      expect(mkdirCatch).not.toMatch(/return\s*\(\s*\)\s*=>\s*\{\s*\}/);
+    });
   }
 });
 

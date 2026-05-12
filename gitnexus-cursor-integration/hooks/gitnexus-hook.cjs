@@ -223,8 +223,11 @@ function acquireHookSlot(gitNexusDir) {
   try {
     fs.mkdirSync(lockDir, { recursive: true });
   } catch {
-    // Cannot create lock dir — fall through unguarded so the hook still works.
-    return () => {};
+    // Cannot create lock dir (read-only fs, cross-user perm denial, out of
+    // inodes, etc.) — fail closed by returning null. Caller skips augment.
+    // Fail-open here would let N concurrent hooks all proceed unguarded and
+    // reintroduce the #1486 fan-out the guard exists to prevent.
+    return null;
   }
 
   const myPidStr = String(process.pid);
@@ -299,9 +302,11 @@ function acquireHookSlot(gitNexusDir) {
             /* already closed */
           }
         }
-        // PID-liveness wins over age (avoids evicting a slow-but-alive hook).
-        // Age check is a safety net against PID reuse on long-abandoned slots:
-        // 30s >> the 7s augment timeout, so a healthy run never hits it.
+        // For slots younger than HOOK_LOCK_STALE_MS, PID-liveness wins —
+        // a slow-but-alive hook is never wrongly evicted. For older slots,
+        // age is the final arbiter as a defense against PID reuse on long-
+        // abandoned slots. 30s >> the 7s augment timeout, so a healthy run
+        // never crosses this threshold.
         if (isLive && Date.now() - mtimeMs > HOOK_LOCK_STALE_MS) {
           isLive = false;
         }

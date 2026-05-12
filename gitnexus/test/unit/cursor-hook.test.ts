@@ -420,6 +420,29 @@ describe('Cursor hook concurrency guard', () => {
     );
     expect(slotFn).not.toContain('readdirSync');
   });
+
+  it('fails closed when lock dir cannot be created', () => {
+    // Regression: see hooks.test.ts. The mkdirSync catch must return null
+    // (skip augment) rather than `() => {}` (proceed unguarded), so that
+    // a read-only or cross-user `.gitnexus/` cannot reintroduce #1486.
+    const slotFn = source.slice(
+      source.indexOf('function acquireHookSlot'),
+      source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+    );
+    const mkdirCatch = slotFn.slice(
+      slotFn.indexOf('fs.mkdirSync(lockDir'),
+      slotFn.indexOf('const myPidStr'),
+    );
+    expect(mkdirCatch).toContain('return null');
+    expect(mkdirCatch).not.toMatch(/return\s*\(\s*\)\s*=>\s*\{\s*\}/);
+  });
+
+  // Note: the 10-concurrent-spawner burst test that validates `wx`
+  // (O_CREAT|O_EXCL) under simultaneous contention lives in
+  // hooks.test.ts. The Cursor hook uses byte-for-byte the same
+  // acquireHookSlot, so duplicating the burst test here would only test
+  // the OS primitive, not Cursor-specific wiring. The source-level checks
+  // above guarantee the Cursor hook keeps calling that same algorithm.
 });
 
 // ─── Integration: concurrency guard skips when slots are full ──────
