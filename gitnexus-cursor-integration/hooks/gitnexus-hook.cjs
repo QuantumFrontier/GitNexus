@@ -251,15 +251,22 @@ function acquireHookSlot(gitNexusDir) {
         return release;
       } catch {
         // Slot exists. Decide whether to take it over.
-        let stat;
+        // Open once and inspect mtime + content via the same fd so there's
+        // no TOCTOU between the metadata check and the content read
+        // (codeql js/file-system-race).
+        let fd;
         try {
-          stat = fs.statSync(slotPath);
+          fd = fs.openSync(slotPath, 'r');
         } catch {
-          continue; // Vanished between EEXIST and stat — retry this slot.
+          continue; // Vanished between EEXIST and open — retry this slot.
         }
         let isLive = false;
+        let mtimeMs = Date.now();
         try {
-          const ownerStr = fs.readFileSync(slotPath, 'utf-8').trim();
+          mtimeMs = fs.fstatSync(fd).mtimeMs;
+          const buf = Buffer.alloc(32);
+          const n = fs.readSync(fd, buf, 0, 32, 0);
+          const ownerStr = buf.slice(0, n).toString('utf-8').trim();
           if (ownerStr === '') {
             // Owner created the file but hasn't written its PID yet. The
             // wx open+write window is microseconds; give it the benefit
@@ -278,11 +285,17 @@ function acquireHookSlot(gitNexusDir) {
           }
         } catch {
           /* unreadable — treat as dead */
+        } finally {
+          try {
+            fs.closeSync(fd);
+          } catch {
+            /* already closed */
+          }
         }
         // PID-liveness wins over age (avoids evicting a slow-but-alive hook).
         // Age check is a safety net against PID reuse on long-abandoned slots:
         // 30s >> the 7s augment timeout, so a healthy run never hits it.
-        if (isLive && Date.now() - stat.mtimeMs > HOOK_LOCK_STALE_MS) {
+        if (isLive && Date.now() - mtimeMs > HOOK_LOCK_STALE_MS) {
           isLive = false;
         }
         if (isLive) break; // Try the next slot.
