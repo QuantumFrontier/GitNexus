@@ -278,8 +278,15 @@ function acquireHookSlot(gitNexusDir) {
               try {
                 process.kill(owner, 0);
                 isLive = true;
-              } catch {
-                /* ESRCH (or EPERM under cross-user) — treat as dead */
+              } catch (e) {
+                // ESRCH = process gone → treat as dead. EPERM = process exists
+                // but owned by another user (cross-user lock dir) → still alive,
+                // keep the slot. Anything else: be conservative, assume alive.
+                if (e && e.code === 'ESRCH') {
+                  isLive = false;
+                } else {
+                  isLive = true;
+                }
               }
             }
           }
