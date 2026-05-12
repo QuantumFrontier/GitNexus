@@ -60,16 +60,35 @@ function parseCursorOutput(stdout: string): { additional_context?: string } | nu
 // ─── Test fixtures ──────────────────────────────────────────────────
 
 let tmpDir: string;
+// Separate fixture for the concurrency guard tests: this one has a real
+// `.gitnexus/` so the hook reaches acquireHookSlot. The base tmpDir above
+// deliberately has no .gitnexus so unrelated early-exit tests stay cheap.
+let guardTmpDir: string;
+let guardGitNexusDir: string;
 
 beforeAll(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-hook-test-'));
   spawnSync('git', ['init'], { cwd: tmpDir, stdio: 'pipe' });
   spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: tmpDir, stdio: 'pipe' });
   spawnSync('git', ['config', 'user.name', 'Test'], { cwd: tmpDir, stdio: 'pipe' });
+
+  guardTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-hook-guard-'));
+  guardGitNexusDir = path.join(guardTmpDir, '.gitnexus');
+  fs.mkdirSync(guardGitNexusDir, { recursive: true });
+  spawnSync('git', ['init'], { cwd: guardTmpDir, stdio: 'pipe' });
+  spawnSync('git', ['config', 'user.email', 'test@test.com'], {
+    cwd: guardTmpDir,
+    stdio: 'pipe',
+  });
+  spawnSync('git', ['config', 'user.name', 'Test'], { cwd: guardTmpDir, stdio: 'pipe' });
+  fs.writeFileSync(path.join(guardTmpDir, 'dummy.txt'), 'hello');
+  spawnSync('git', ['add', '.'], { cwd: guardTmpDir, stdio: 'pipe' });
+  spawnSync('git', ['commit', '-m', 'init'], { cwd: guardTmpDir, stdio: 'pipe' });
 });
 
 afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(guardTmpDir, { recursive: true, force: true });
 });
 
 // ─── Manifest + hook file presence ───────────────────────────────────
@@ -372,6 +391,126 @@ describe('Cursor hook debug logging', () => {
     expect(verbose.stderr).toContain('GitNexus Cursor hook stdin');
     expect(verbose.stderr).toContain('"tool_name":"Grep"');
     expect(verbose.stdout.trim()).toBe('');
+  });
+});
+
+// ─── Source code regression: concurrency guard (#1486) ─────────────
+
+describe('Cursor hook concurrency guard', () => {
+  const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+
+  it('defines acquireHookSlot with MAX_INFLIGHT constant', () => {
+    expect(source).toContain('function acquireHookSlot');
+    expect(source).toContain('HOOK_LOCK_MAX_INFLIGHT');
+  });
+
+  it('calls acquireHookSlot in main() and releases via finally', () => {
+    // The Cursor hook uses a flat main() dispatcher rather than a separate
+    // handlePreToolUse — assert the guard call + finally release wiring is
+    // present so a future refactor cannot accidentally skip it.
+    expect(source).toContain('acquireHookSlot(');
+    expect(source).toMatch(/finally\s*\{[^}]*release\(\)/s);
+  });
+
+  it('uses atomic fixed-name slot files (hard cap, not soft TOCTOU cap)', () => {
+    expect(source).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
+    const slotFn = source.slice(
+      source.indexOf('function acquireHookSlot'),
+      source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+    );
+    expect(slotFn).not.toContain('readdirSync');
+  });
+});
+
+// ─── Integration: concurrency guard skips when slots are full ──────
+
+describe('Cursor hook concurrency guard (integration)', () => {
+  it('exits silently when all MAX_INFLIGHT slots hold live pids', async () => {
+    const { spawn } = await import('child_process');
+    const lockDir = path.join(guardGitNexusDir, '.hook-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+
+    const sleepers = [0, 1, 2].map(() =>
+      spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], {
+        stdio: 'ignore',
+        detached: false,
+      }),
+    );
+    const writtenLocks: string[] = [];
+    try {
+      for (let i = 0; i < sleepers.length; i++) {
+        const p = path.join(lockDir, `slot-${i}.lock`);
+        fs.writeFileSync(p, String(sleepers[i].pid));
+        writtenLocks.push(p);
+      }
+
+      const result = runHook(CURSOR_HOOK, {
+        tool_name: 'Grep',
+        tool_input: { query: 'validateUser' },
+        cwd: guardTmpDir,
+      });
+
+      expect(result.stdout.trim()).toBe('');
+      for (let i = 0; i < sleepers.length; i++) {
+        const p = path.join(lockDir, `slot-${i}.lock`);
+        expect(fs.existsSync(p)).toBe(true);
+        expect(fs.readFileSync(p, 'utf-8').trim()).toBe(String(sleepers[i].pid));
+      }
+    } finally {
+      for (const child of sleepers) {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const p of writtenLocks) {
+        try {
+          fs.unlinkSync(p);
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  it('reclaims a slot held by a dead pid', () => {
+    const lockDir = path.join(guardGitNexusDir, '.hook-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+    const deadPid = 2_147_483_640;
+    const stalePath = path.join(lockDir, 'slot-0.lock');
+    try {
+      fs.writeFileSync(stalePath, String(deadPid));
+      expect(fs.readFileSync(stalePath, 'utf-8').trim()).toBe(String(deadPid));
+
+      runHook(CURSOR_HOOK, {
+        tool_name: 'Grep',
+        tool_input: { query: 'validateUser' },
+        cwd: guardTmpDir,
+      });
+
+      // The hook reclaimed and then released slot-0 — either gone (released)
+      // or no longer owned by the dead pid.
+      if (fs.existsSync(stalePath)) {
+        expect(fs.readFileSync(stalePath, 'utf-8').trim()).not.toBe(String(deadPid));
+      }
+    } finally {
+      try {
+        fs.unlinkSync(stalePath);
+      } catch {
+        /* already pruned */
+      }
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        /* ignore */
+      }
+    }
   });
 });
 

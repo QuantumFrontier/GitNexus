@@ -161,7 +161,7 @@ function extractPattern(toolName, toolInput) {
 }
 
 /**
- * Concurrency guard for the augment subprocess.
+ * Concurrency guard for the augment subprocess (hard cap).
  *
  * Claude Code fires PreToolUse hooks per parallel tool call. With no cap, N
  * parallel Grep/Glob/Bash tool calls spawn N concurrent `gitnexus augment`
@@ -171,8 +171,18 @@ function extractPattern(toolName, toolInput) {
  * silently above that. Augment is a best-effort enrichment; missing a few
  * fires under heavy parallel load is preferable to melting the box.
  *
- * Implementation: lockfiles named `<pid>.lock` under `<.gitnexus>/.hook-locks/`.
- * Stale entries are pruned by age (>30s mtime) or by pid-liveness check.
+ * Implementation: fixed-name slot files `slot-0.lock` ... `slot-N.lock`
+ * under `<.gitnexus>/.hook-locks/`. Each file is created with `wx`
+ * (O_CREAT|O_EXCL), which is atomic across processes at the OS level —
+ * exactly one process wins each slot. This is a HARD cap, not the
+ * count-then-claim soft cap that an earlier revision shipped (it had a
+ * TOCTOU window between readdirSync and the per-pid wx write).
+ *
+ * Owner identity is written into the slot file as the PID, used for
+ * stale-takeover when a hook crashes without releasing. PID-liveness is
+ * checked before age so a slow-but-alive hook is never wrongly evicted;
+ * the age window only kicks in to defend against PID reuse on a long-
+ * abandoned slot.
  */
 const HOOK_LOCK_SUBDIR = '.hook-locks';
 const HOOK_LOCK_MAX_INFLIGHT = 3;
@@ -180,68 +190,83 @@ const HOOK_LOCK_STALE_MS = 30000;
 
 function acquireHookSlot(gitNexusDir) {
   const lockDir = path.join(gitNexusDir, HOOK_LOCK_SUBDIR);
-  let entries;
   try {
     fs.mkdirSync(lockDir, { recursive: true });
-    entries = fs.readdirSync(lockDir);
   } catch {
-    // Cannot read lock dir — fall through unguarded so the hook still works.
+    // Cannot create lock dir — fall through unguarded so the hook still works.
     return () => {};
   }
 
-  const now = Date.now();
-  let active = 0;
-  for (const entry of entries) {
-    if (!entry.endsWith('.lock')) continue;
-    const lockPath = path.join(lockDir, entry);
-    const pid = Number.parseInt(entry, 10);
-    let stale = false;
-    try {
-      const stat = fs.statSync(lockPath);
-      if (now - stat.mtimeMs > HOOK_LOCK_STALE_MS) stale = true;
-    } catch {
-      stale = true;
-    }
-    if (!stale && Number.isFinite(pid) && pid > 0) {
+  const myPidStr = String(process.pid);
+
+  for (let slot = 0; slot < HOOK_LOCK_MAX_INFLIGHT; slot++) {
+    const slotPath = path.join(lockDir, `slot-${slot}.lock`);
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        process.kill(pid, 0);
-        active++;
-        continue;
+        fs.writeFileSync(slotPath, myPidStr, { flag: 'wx' });
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          try {
+            // Only unlink if we still own the slot. If we appeared stale and
+            // another hook took over, the file now belongs to it — leave alone.
+            const content = fs.readFileSync(slotPath, 'utf-8').trim();
+            if (content === myPidStr) fs.unlinkSync(slotPath);
+          } catch {
+            /* already removed or unreadable */
+          }
+        };
+        process.on('exit', release);
+        return release;
       } catch {
-        stale = true;
-      }
-    }
-    if (stale) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        /* another hook beat us to it */
+        // Slot exists. Decide whether to take it over.
+        let stat;
+        try {
+          stat = fs.statSync(slotPath);
+        } catch {
+          continue; // Vanished between EEXIST and stat — retry this slot.
+        }
+        let isLive = false;
+        try {
+          const ownerStr = fs.readFileSync(slotPath, 'utf-8').trim();
+          if (ownerStr === '') {
+            // Owner created the file but hasn't written its PID yet. The
+            // wx open+write window is microseconds; give it the benefit
+            // of the doubt and treat as live.
+            isLive = true;
+          } else {
+            const owner = Number.parseInt(ownerStr, 10);
+            if (Number.isFinite(owner) && owner > 0) {
+              try {
+                process.kill(owner, 0);
+                isLive = true;
+              } catch {
+                /* ESRCH (or EPERM under cross-user) — treat as dead */
+              }
+            }
+          }
+        } catch {
+          /* unreadable — treat as dead */
+        }
+        // PID-liveness wins over age (avoids evicting a slow-but-alive hook).
+        // Age check is a safety net against PID reuse on long-abandoned slots:
+        // 30s >> the 7s augment timeout, so a healthy run never hits it.
+        if (isLive && Date.now() - stat.mtimeMs > HOOK_LOCK_STALE_MS) {
+          isLive = false;
+        }
+        if (isLive) break; // Try the next slot.
+        try {
+          fs.unlinkSync(slotPath);
+        } catch {
+          /* another hook beat us to it — retry will hit EEXIST */
+        }
+        // Loop and retry this slot.
       }
     }
   }
 
-  if (active >= HOOK_LOCK_MAX_INFLIGHT) return null;
-
-  const ownLock = path.join(lockDir, `${process.pid}.lock`);
-  try {
-    fs.writeFileSync(ownLock, '', { flag: 'wx' });
-  } catch {
-    // Couldn't claim a slot — proceed unguarded rather than block legitimate work.
-    return () => {};
-  }
-
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
-    try {
-      fs.unlinkSync(ownLock);
-    } catch {
-      /* pruned by another hook */
-    }
-  };
-  process.on('exit', release);
-  return release;
+  return null;
 }
 
 /**
