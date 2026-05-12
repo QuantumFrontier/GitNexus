@@ -35,6 +35,15 @@ const CURSOR_HOOK = path.resolve(
   'hooks',
   'gitnexus-hook.cjs',
 );
+const CURSOR_HOOK_LOCK = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-cursor-integration',
+  'hooks',
+  'hook-lock.cjs',
+);
 const CURSOR_HOOKS_JSON = path.resolve(
   __dirname,
   '..',
@@ -398,10 +407,16 @@ describe('Cursor hook debug logging', () => {
 
 describe('Cursor hook concurrency guard', () => {
   const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+  const lockSource = fs.readFileSync(CURSOR_HOOK_LOCK, 'utf-8');
 
-  it('defines acquireHookSlot with MAX_INFLIGHT constant', () => {
-    expect(source).toContain('function acquireHookSlot');
-    expect(source).toContain('HOOK_LOCK_MAX_INFLIGHT');
+  it('loads acquireHookSlot helper module', () => {
+    expect(source).toContain('acquireHookSlot');
+    expect(source).toContain('hook-lock.cjs');
+  });
+
+  it('helper defines acquireHookSlot with MAX_INFLIGHT constant', () => {
+    expect(lockSource).toContain('function acquireHookSlot');
+    expect(lockSource).toContain('HOOK_LOCK_MAX_INFLIGHT');
   });
 
   it('calls acquireHookSlot in main() and releases via finally', () => {
@@ -413,10 +428,10 @@ describe('Cursor hook concurrency guard', () => {
   });
 
   it('uses atomic fixed-name slot files (hard cap, not soft TOCTOU cap)', () => {
-    expect(source).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
-    const slotFn = source.slice(
-      source.indexOf('function acquireHookSlot'),
-      source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+    expect(lockSource).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
+    const slotFn = lockSource.slice(
+      lockSource.indexOf('function acquireHookSlot'),
+      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
     );
     expect(slotFn).not.toContain('readdirSync');
   });
@@ -425,9 +440,9 @@ describe('Cursor hook concurrency guard', () => {
     // Regression: see hooks.test.ts. The mkdirSync catch must return null
     // (skip augment) rather than `() => {}` (proceed unguarded), so that
     // a read-only or cross-user `.gitnexus/` cannot reintroduce #1486.
-    const slotFn = source.slice(
-      source.indexOf('function acquireHookSlot'),
-      source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+    const slotFn = lockSource.slice(
+      lockSource.indexOf('function acquireHookSlot'),
+      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
     );
     const mkdirCatch = slotFn.slice(
       slotFn.indexOf('fs.mkdirSync(lockDir'),
@@ -591,6 +606,7 @@ describe('Cursor integration install docs', () => {
     const body = fs.readFileSync(integrationReadme, 'utf-8');
     expect(body).toContain('.cursor/hooks.json');
     expect(body).toContain('hooks/gitnexus-hook.cjs');
+    expect(body).toContain('hooks/hook-lock.cjs');
     expect(body).toContain('Hook install');
   });
 

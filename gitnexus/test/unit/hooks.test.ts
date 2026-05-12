@@ -26,6 +26,7 @@ import { runHook, parseHookOutput } from '../utils/hook-test-helpers.js';
 // ─── Paths to both hook variants ────────────────────────────────────
 
 const CJS_HOOK = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'gitnexus-hook.cjs');
+const CJS_HOOK_LOCK = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'hook-lock.cjs');
 const PLUGIN_HOOK = path.resolve(
   __dirname,
   '..',
@@ -34,6 +35,15 @@ const PLUGIN_HOOK = path.resolve(
   'gitnexus-claude-plugin',
   'hooks',
   'gitnexus-hook.js',
+);
+const PLUGIN_HOOK_LOCK = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-claude-plugin',
+  'hooks',
+  'hook-lock.js',
 );
 
 // ─── Test fixtures: temporary .gitnexus directory ───────────────────
@@ -297,12 +307,18 @@ describe('Git mutation regex', () => {
 // ─── Source code regression: PreToolUse concurrency guard (#1486) ──
 
 describe('PreToolUse concurrency guard', () => {
-  for (const [label, hookPath] of [
-    ['CJS', CJS_HOOK],
-    ['Plugin', PLUGIN_HOOK],
+  for (const [label, hookPath, lockPath] of [
+    ['CJS', CJS_HOOK, CJS_HOOK_LOCK],
+    ['Plugin', PLUGIN_HOOK, PLUGIN_HOOK_LOCK],
   ] as const) {
-    it(`${label} hook defines acquireHookSlot`, () => {
+    it(`${label} hook loads acquireHookSlot helper`, () => {
       const source = fs.readFileSync(hookPath, 'utf-8');
+      expect(source).toContain('acquireHookSlot');
+      expect(source).toContain('hook-lock');
+    });
+
+    it(`${label} helper defines acquireHookSlot`, () => {
+      const source = fs.readFileSync(lockPath, 'utf-8');
       expect(source).toContain('function acquireHookSlot');
       expect(source).toContain('HOOK_LOCK_MAX_INFLIGHT');
     });
@@ -322,7 +338,7 @@ describe('PreToolUse concurrency guard', () => {
       // entries then wrote a per-pid lock, which let simultaneous bursts
       // exceed MAX_INFLIGHT. The hard-cap version writes to fixed-name
       // slot-N.lock paths so O_CREAT|O_EXCL is atomic across processes.
-      const source = fs.readFileSync(hookPath, 'utf-8');
+      const source = fs.readFileSync(lockPath, 'utf-8');
       expect(source).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
       // And no longer reads the lock dir to count active hooks.
       const slotFn = source.slice(
@@ -337,7 +353,7 @@ describe('PreToolUse concurrency guard', () => {
       // mkdirSync failure, which left callers — `if (!release) return;` — to
       // proceed unguarded and reintroduce the #1486 fan-out on read-only or
       // cross-user `.gitnexus/` setups. The guard must fail closed (null).
-      const source = fs.readFileSync(hookPath, 'utf-8');
+      const source = fs.readFileSync(lockPath, 'utf-8');
       const slotFn = source.slice(
         source.indexOf('function acquireHookSlot'),
         source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
